@@ -282,11 +282,17 @@ pub struct SearchState {
     /// The search thread checks this periodically and stops early.
     pub cancel: Arc<AtomicBool>,
     
+    /// True if the last search was cancelled (allows resume)
+    pub was_cancelled: Arc<AtomicBool>,
+    
     /// Number of registry keys scanned so far (for progress display)
     pub keys_scanned: Arc<AtomicU64>,
     
     /// Current key path being scanned (for "Searching: ..." display)
     pub current_path: Arc<Mutex<String>>,
+    
+    /// Paths that have already been fully scanned (for resume support)
+    pub scanned_paths: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl SearchState {
@@ -296,8 +302,10 @@ impl SearchState {
             results: Arc::new(Mutex::new(Vec::new())),
             is_searching: Arc::new(AtomicBool::new(false)),
             cancel: Arc::new(AtomicBool::new(false)),
+            was_cancelled: Arc::new(AtomicBool::new(false)),
             keys_scanned: Arc::new(AtomicU64::new(0)),
             current_path: Arc::new(Mutex::new(String::new())),
+            scanned_paths: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -309,7 +317,18 @@ impl SearchState {
         self.results.lock().unwrap().clear();
         self.is_searching.store(false, Ordering::SeqCst);
         self.cancel.store(false, Ordering::SeqCst);
+        self.was_cancelled.store(false, Ordering::SeqCst);
         self.keys_scanned.store(0, Ordering::SeqCst);
+        *self.current_path.lock().unwrap() = String::new();
+        self.scanned_paths.lock().unwrap().clear();
+    }
+    
+    /// Prepare state for resuming a cancelled search.
+    /// Keeps results and scanned paths, resets control flags.
+    pub fn prepare_resume(&self) {
+        self.is_searching.store(false, Ordering::SeqCst);
+        self.cancel.store(false, Ordering::SeqCst);
+        self.was_cancelled.store(false, Ordering::SeqCst);
         *self.current_path.lock().unwrap() = String::new();
     }
 }
@@ -464,39 +483,61 @@ pub fn start_search(options: SearchOptions, state: SearchState, index: Option<Re
 ///
 /// # Limitations
 ///
-/// SQLite search doesn't support regex patterns. If `options.use_regex`
-/// is true, it goes straight to live search.
+/// SQLite search is fast because it queries the local cache.
+/// If no results are found, you can optionally fall back to live registry.
 pub fn start_search_with_store(
     options: SearchOptions,
     state: SearchState,
     store: SyncStore,
-    fallback_to_live: bool,
+    _fallback_to_live: bool,  // Currently unused - SQLite only for consistency
 ) {
     state.reset();
     state.is_searching.store(true, Ordering::SeqCst);
 
     let state_clone = state.clone();
     std::thread::spawn(move || {
-        // Check if we have enough cached data to answer from SQLite
-        let cached_keys = store.cached_key_count();
-        let _cached_values = store.cached_value_count();
+        // Search SQLite cache - fast and consistent
+        try_sqlite_search(&options, &state_clone, &store);
+        
+        // Mark search complete
+        state_clone.is_searching.store(false, Ordering::SeqCst);
+    });
+}
 
-        // If we have substantial cached data, use SQLite search
-        // Threshold: at least 1000 keys cached
-        let use_sqlite = cached_keys >= 1000;
+/// Start a live registry search (slower but comprehensive).
+/// Use this when SQLite cache doesn't have what you need.
+pub fn start_live_search(
+    options: SearchOptions,
+    state: SearchState,
+) {
+    state.reset();
+    state.is_searching.store(true, Ordering::SeqCst);
 
-        if use_sqlite {
-            try_sqlite_search(&options, &state_clone, &store);
-        }
+    let state_clone = state.clone();
+    std::thread::spawn(move || {
+        run_search(options, state_clone);
+    });
+}
 
-        // If SQLite search didn't find much or was skipped, and fallback is enabled
-        let result_count = state_clone.results.lock().unwrap().len();
-        if result_count == 0 && fallback_to_live && !state_clone.cancel.load(Ordering::Relaxed) {
-            // Fall back to live registry scan
-            run_search(options, state_clone);
-        } else {
-            state_clone.is_searching.store(false, Ordering::SeqCst);
-        }
+/// Resume a cancelled live search from where it left off.
+/// 
+/// If the search wasn't cancelled or there's nothing to resume, this does nothing.
+pub fn resume_live_search(
+    options: SearchOptions,
+    state: SearchState,
+) {
+    // Only resume if the last search was cancelled
+    if !state.was_cancelled.load(Ordering::Relaxed) {
+        return;
+    }
+    
+    state.prepare_resume();
+    state.is_searching.store(true, Ordering::SeqCst);
+
+    let state_clone = state.clone();
+    std::thread::spawn(move || {
+        // run_search uses scanned_paths to skip already-visited branches
+        run_search(options, state_clone);
     });
 }
 
@@ -508,29 +549,26 @@ pub fn start_search_with_store(
 ///
 /// # How It Works
 ///
-/// Uses SQL LIKE queries to search the cached registry data.
+/// - For plain text searches: Uses SQL LIKE queries (very fast with indexes)
+/// - For regex searches: Fetches data and filters with Rust regex (still faster than live registry)
+///
 /// Much faster than live search because:
 /// - No Windows API calls
-/// - SQLite can use indexes
+/// - SQLite can use indexes for plain text
 /// - Data is already organized
 ///
 /// # Limitations
 ///
-/// - Doesn't support regex (SQLite LIKE is limited)
 /// - Only searches cached data (may be stale or incomplete)
 fn try_sqlite_search(options: &SearchOptions, state: &SearchState, store: &SyncStore) {
-    // Skip regex searches - SQLite LIKE doesn't support regex
-    // Fall back to live search for those
-    if options.use_regex {
-        return;
-    }
-
     // Convert our options to the format SyncStore expects
+    // SQLite search now supports regex via post-fetch filtering
     let cached_options = CachedSearchOptions {
         search_keys: options.search_keys,
         search_value_names: options.search_value_names,
         search_value_data: options.search_value_data,
         case_sensitive: options.case_sensitive,
+        use_regex: options.use_regex,
         max_results: options.max_results,
         roots: options.roots_to_search.clone(),
         value_type_filter: options.value_type_filter.clone(),
@@ -764,6 +802,14 @@ fn run_search(options: SearchOptions, state: SearchState) {
     // Process top-level branches in parallel using rayon
     // par_iter() automatically distributes work across available CPU cores
     work_items.par_iter().for_each(|(root, subkey)| {
+        // Build full path for tracking
+        let full_path = format!("{}\\{}", root, subkey);
+        
+        // Skip if already scanned (for resume support)
+        if state.scanned_paths.lock().unwrap().contains(&full_path) {
+            return;
+        }
+        
         // Early exit if cancelled
         if state.cancel.load(Ordering::Relaxed) {
             return;
@@ -775,9 +821,17 @@ fn run_search(options: SearchOptions, state: SearchState) {
         }
         // Recursively search this branch
         search_key_recursive(root, subkey, &options, &matcher, &state, 1);
+        
+        // Mark this branch as fully scanned (if not cancelled mid-way)
+        if !state.cancel.load(Ordering::Relaxed) {
+            state.scanned_paths.lock().unwrap().insert(full_path);
+        }
     });
 
     // Mark search as complete
+    if state.cancel.load(Ordering::Relaxed) {
+        state.was_cancelled.store(true, Ordering::SeqCst);
+    }
     state.is_searching.store(false, Ordering::SeqCst);
 }
 

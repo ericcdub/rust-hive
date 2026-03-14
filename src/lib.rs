@@ -52,4 +52,4 @@ pub use bookmarks::{Bookmark, BookmarkColor};
 pub use index::RegistryIndex;
 pub use registry::{RegValue, RegistryValue, RootKey};
 pub use search::{SearchOptions, SearchResult, SearchState};
-pub use sync::{PendingChange, SyncConflict, SyncStore};
+pub use sync::{DebugCategory, DebugEvent, PendingChange, SyncConflict, SyncStore};

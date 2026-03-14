@@ -355,6 +355,39 @@ pub struct SyncStore {
     pub pull_roots: Arc<Mutex<Vec<RootKey>>>,
     /// Maximum depth to traverse during pull (None = unlimited)
     pub pull_max_depth: Arc<Mutex<Option<usize>>>,
+
+    // ── Debug Logging ──
+    
+    /// Whether debug logging is enabled
+    pub debug_enabled: Arc<AtomicBool>,
+    /// Ring buffer of recent debug events (newest at end)
+    pub debug_log: Arc<Mutex<Vec<DebugEvent>>>,
+}
+
+/// A debug event logged by the sync store.
+#[derive(Debug, Clone)]
+pub struct DebugEvent {
+    /// When the event occurred (wall-clock time)
+    pub timestamp: SystemTime,
+    /// Category of the event
+    pub category: DebugCategory,
+    /// Human-readable description
+    pub message: String,
+}
+
+/// Category of debug events for filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugCategory {
+    /// Reading from Windows Registry
+    RegistryRead,
+    /// Writing to Windows Registry
+    RegistryWrite,
+    /// Reading from SQLite
+    SqliteRead,
+    /// Writing to SQLite
+    SqliteWrite,
+    /// Cache operations (memory)
+    Cache,
 }
 
 /// Implementation of SyncStore - all the methods that make it work.
@@ -407,6 +440,8 @@ impl SyncStore {
                 RootKey::HkeyLocalMachine,
             ])),
             pull_max_depth: Arc::new(Mutex::new(Some(8))),
+            debug_enabled: Arc::new(AtomicBool::new(false)),
+            debug_log: Arc::new(Mutex::new(Vec::with_capacity(1000))),
         };
 
         // If database opens successfully, initialize schema and load stats
@@ -462,6 +497,8 @@ impl SyncStore {
     /// - (no modifier): Private to this module only
     pub(crate) fn open_db(&self) -> Result<Connection, rusqlite::Error> {
         let conn = Connection::open(self.db_path.as_ref())?;
+        // Set busy timeout to wait up to 5 seconds if database is locked
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -615,6 +652,38 @@ impl SyncStore {
         self.save_setting("pull_max_depth", &val);
     }
 
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Debug Logging
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    /// Log a debug event if debug mode is enabled.
+    pub fn log_debug(&self, category: DebugCategory, message: impl Into<String>) {
+        if !self.debug_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let event = DebugEvent {
+            timestamp: SystemTime::now(),
+            category,
+            message: message.into(),
+        };
+        let mut log = self.debug_log.lock().unwrap();
+        // Keep only the last 1000 events (ring buffer behavior)
+        if log.len() >= 1000 {
+            log.remove(0);
+        }
+        log.push(event);
+    }
+
+    /// Get a snapshot of the debug log for display.
+    pub fn get_debug_log(&self) -> Vec<DebugEvent> {
+        self.debug_log.lock().unwrap().clone()
+    }
+
+    /// Clear the debug log.
+    pub fn clear_debug_log(&self) {
+        self.debug_log.lock().unwrap().clear();
+    }
+
     /// Returns true if there are any pending changes waiting to be synced.
     pub fn has_pending_changes(&self) -> bool {
         self.stats.lock().unwrap().pending_changes > 0
@@ -623,6 +692,13 @@ impl SyncStore {
     /// Returns the count of pending changes (for UI display).
     pub fn pending_change_count(&self) -> usize {
         self.stats.lock().unwrap().pending_changes
+    }
+
+    /// Returns the size of the SQLite database file in bytes.
+    pub fn get_db_size_bytes(&self) -> u64 {
+        std::fs::metadata(self.db_path.as_ref())
+            .map(|m| m.len())
+            .unwrap_or(0)
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -755,6 +831,7 @@ impl SyncStore {
         let root = root.clone();
         let path = path.to_string();
         std::thread::spawn(move || {
+            store.log_debug(DebugCategory::RegistryRead, format!("enumerate_subkeys: {}\\{}", root, path));
             if let Ok(subkeys) = registry::enumerate_subkeys(&root, &path) {
                 // Wrap in Arc so both the cache and this thread can hold a reference.
                 let cached = Arc::new(subkeys);
@@ -799,6 +876,7 @@ impl SyncStore {
                 store.pending_fetches.fetch_sub(1, Ordering::Relaxed);
                 // ── Background SQLite persistence (does not affect UI) ────────────
                 if let Ok(conn) = store.open_db() {
+                    store.log_debug(DebugCategory::SqliteWrite, format!("cache {} subkeys for {}\\{}", cached.len(), root, path));
                     conn.execute_batch("BEGIN").ok();
                     for subkey in cached.iter() {
                         let child_path = if path.is_empty() {
@@ -899,9 +977,11 @@ impl SyncStore {
         let root = root.clone();
         let path = path.to_string();
         std::thread::spawn(move || {
+            store.log_debug(DebugCategory::RegistryRead, format!("enumerate_values: {}\\{}", root, path));
             if let Ok(values) = registry::enumerate_values(&root, &path) {
                 // Move values into cache (no clone needed — pull_key_values re-reads
                 // from the registry for SQLite, so we don't need values after this).
+                store.log_debug(DebugCategory::Cache, format!("cache {} values for {}\\{}", values.len(), root, path));
                 store.value_cache.lock().unwrap().insert(key.clone(), values);
                 // Signal UI immediately — same pattern as fetch_subkeys_async.
                 store.in_flight_fetches.lock().unwrap().remove(&key);
@@ -1035,6 +1115,8 @@ impl SyncStore {
             format!("{}\\{}", parent_path, name)
         };
 
+        self.log_debug(DebugCategory::SqliteWrite, format!("INSERT key: {}\\{}", root_str, child_path));
+
         // Insert into SQLite with dirty=1 (needs sync)
         // registry_lwt=0 because it doesn't exist in registry yet
         conn.execute(
@@ -1120,6 +1202,8 @@ impl SyncStore {
         };
 
         let (type_str, data) = serialize_reg_value(value);
+
+        self.log_debug(DebugCategory::SqliteWrite, format!("INSERT value: {}\\{}\\{}", root_str, path, display_name));
 
         conn.execute(
             "INSERT OR REPLACE INTO key_values 
@@ -1320,6 +1404,8 @@ impl SyncStore {
         for (id, change) in &changes {
             *self.current_sync_item.lock().unwrap() = change.description();
             self.sync_progress.fetch_add(1, Ordering::SeqCst);
+
+            self.log_debug(DebugCategory::RegistryWrite, format!("push: {}", change.description()));
 
             match self.apply_change_to_registry(&conn, change.clone()) {
                 Ok(()) => {
@@ -1977,6 +2063,7 @@ impl SyncStore {
 
     // ── Search (from SQLite) ────────────────────────────────────────────────
 
+    /// Search keys using plain text (LIKE query)
     pub fn search_keys(&self, query: &str, case_sensitive: bool) -> Vec<(RootKey, String)> {
         let conn = match self.open_db() {
             Ok(c) => c,
@@ -2011,6 +2098,48 @@ impl SyncStore {
             } else {
                 true
             }
+        })
+        .filter_map(|(root_str, path)| {
+            RootKey::from_name(&root_str).map(|r| (r, path))
+        })
+        .collect()
+    }
+
+    /// Search keys using regex pattern (fetches all keys, filters with regex)
+    pub fn search_keys_regex(&self, pattern: &str, case_sensitive: bool) -> Vec<(RootKey, String)> {
+        let conn = match self.open_db() {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+
+        // Build regex with optional case-insensitivity
+        let regex_pattern = if case_sensitive {
+            pattern.to_string()
+        } else {
+            format!("(?i){}", pattern)
+        };
+        let regex = match regex::Regex::new(&regex_pattern) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        // Fetch all non-deleted keys
+        let mut stmt = match conn.prepare("SELECT root, path FROM keys WHERE NOT deleted") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        stmt.query_map([], |row| {
+            let root_str: String = row.get(0)?;
+            let path: String = row.get(1)?;
+            Ok((root_str, path))
+        })
+        .unwrap_or_else(|_| panic!("query failed"))
+        .filter_map(|r| r.ok())
+        .filter(|(_, path)| {
+            // Match regex against the key name (last component of path)
+            let name = path.rsplit('\\').next().unwrap_or(path);
+            regex.is_match(name)
         })
         .filter_map(|(root_str, path)| {
             RootKey::from_name(&root_str).map(|r| (r, path))
@@ -2143,7 +2272,89 @@ impl SyncStore {
         results
     }
 
+    /// Search values using regex pattern (fetches all values, filters with regex)
+    pub fn search_values_regex(
+        &self,
+        pattern: &str,
+        case_sensitive: bool,
+        search_names: bool,
+        search_data: bool,
+        value_type_filter: Option<&str>,
+    ) -> Vec<CachedValueMatch> {
+        let conn = match self.open_db() {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+
+        // Build regex with optional case-insensitivity
+        let regex_pattern = if case_sensitive {
+            pattern.to_string()
+        } else {
+            format!("(?i){}", pattern)
+        };
+        let regex = match regex::Regex::new(&regex_pattern) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        // Build SQL with optional value type filter
+        let sql = if let Some(vt) = value_type_filter {
+            format!(
+                "SELECT root, key_path, value_name, value_type, value_data FROM key_values WHERE NOT deleted AND value_type = '{}'",
+                vt.replace('\'', "''")
+            )
+        } else {
+            "SELECT root, key_path, value_name, value_type, value_data FROM key_values WHERE NOT deleted".to_string()
+        };
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let rows: Vec<(String, String, String, String, Vec<u8>)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            })
+            .unwrap_or_else(|_| panic!("query failed"))
+            .filter_map(|r| r.ok())
+            .collect();
+
+        rows.into_iter()
+            .filter_map(|(root_str, path, name, vtype, data)| {
+                let root = RootKey::from_name(&root_str)?;
+                let value = deserialize_reg_value(&vtype, &data);
+                let data_text = value.display_data();
+
+                // Match regex against name and/or data
+                let name_matches = search_names && regex.is_match(&name);
+                let data_matches = search_data && regex.is_match(&data_text);
+
+                if !name_matches && !data_matches {
+                    return None;
+                }
+
+                Some(CachedValueMatch {
+                    root,
+                    path,
+                    value_name: name,
+                    value_type: vtype,
+                    value_data_text: data_text,
+                    matched_name: name_matches,
+                    matched_data: data_matches,
+                })
+            })
+            .collect()
+    }
+
     /// Comprehensive search across keys and values in the SQLite cache.
+    /// Supports both plain text (LIKE) and regex searches.
     pub fn search(
         &self,
         query: &str,
@@ -2152,9 +2363,15 @@ impl SyncStore {
         let mut results = Vec::new();
         let max = options.max_results;
 
-        // Search keys
+        // Search keys - use regex or plain text method
         if options.search_keys {
-            for (root, path) in self.search_keys(query, options.case_sensitive) {
+            let key_matches = if options.use_regex {
+                self.search_keys_regex(query, options.case_sensitive)
+            } else {
+                self.search_keys(query, options.case_sensitive)
+            };
+            
+            for (root, path) in key_matches {
                 if results.len() >= max {
                     break;
                 }
@@ -2172,15 +2389,25 @@ impl SyncStore {
             }
         }
 
-        // Search values
+        // Search values - use regex or plain text method
         if (options.search_value_names || options.search_value_data) && results.len() < max {
-            let value_matches = self.search_values(
-                query,
-                options.case_sensitive,
-                options.search_value_names,
-                options.search_value_data,
-                options.value_type_filter.as_deref(),
-            );
+            let value_matches = if options.use_regex {
+                self.search_values_regex(
+                    query,
+                    options.case_sensitive,
+                    options.search_value_names,
+                    options.search_value_data,
+                    options.value_type_filter.as_deref(),
+                )
+            } else {
+                self.search_values(
+                    query,
+                    options.case_sensitive,
+                    options.search_value_names,
+                    options.search_value_data,
+                    options.value_type_filter.as_deref(),
+                )
+            };
 
             for m in value_matches {
                 if results.len() >= max {
@@ -2236,6 +2463,7 @@ pub struct CachedSearchOptions {
     pub search_value_names: bool,
     pub search_value_data: bool,
     pub case_sensitive: bool,
+    pub use_regex: bool,
     pub max_results: usize,
     pub roots: Vec<RootKey>,
     pub value_type_filter: Option<String>,
@@ -2248,6 +2476,7 @@ impl Default for CachedSearchOptions {
             search_value_names: true,
             search_value_data: true,
             case_sensitive: false,
+            use_regex: false,
             max_results: 10000,
             roots: Vec::new(),
             value_type_filter: None,
