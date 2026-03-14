@@ -1539,6 +1539,42 @@ impl SyncStore {
         });
     }
 
+
+    /// Pull from registry on a background thread (non-blocking).
+    /// 
+    /// Use `is_syncing` to check if still running.
+    pub fn pull_from_registry_async(&self) {
+        if self.is_syncing.load(Ordering::Relaxed) {
+            return; // Already syncing
+        }
+        let store = self.clone();
+        std::thread::spawn(move || {
+            store.pull_from_registry();
+        });
+    }
+
+    /// Push to registry on a background thread (non-blocking).
+    /// 
+    /// Returns immediately. Check `is_syncing` for completion.
+    /// Conflicts will be stored in `pending_conflicts` field.
+    pub fn push_to_registry_async(&self) {
+        if self.is_syncing.load(Ordering::Relaxed) {
+            return; // Already syncing
+        }
+        let store = self.clone();
+        std::thread::spawn(move || {
+            let conflicts = store.push_to_registry();
+            if !conflicts.is_empty() {
+                *store.pending_conflicts.lock().unwrap() = conflicts;
+            }
+        });
+    }
+
+    /// Get any conflicts from the last async push.
+    pub fn take_pending_conflicts(&self) -> Vec<SyncConflict> {
+        std::mem::take(&mut *self.pending_conflicts.lock().unwrap())
+    }
+
     // ── Bookmarks ───────────────────────────────────────────────────────────
 
     pub fn get_bookmarks(&self) -> Vec<crate::bookmarks::Bookmark> {
