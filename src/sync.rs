@@ -43,7 +43,7 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 // Import types from our own crate (this project)
-use crate::bookmarks::BookmarkColor;
+use crate::bookmarks::{Bookmark, BookmarkColor};
 use crate::registry::{self, RegValue, RegistryValue, RootKey};
 
 // External crate imports:
@@ -53,9 +53,9 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 // Standard library imports:
-use std::collections::HashSet;      // A set data structure (no duplicates)
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;             // Cross-platform file path handling
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};  // Thread-safe primitives
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering};  // Thread-safe primitives
 use std::sync::{Arc, Mutex};        // Thread-safe smart pointers
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};  // Time handling
 
@@ -315,6 +315,19 @@ pub struct SyncStore {
     
     /// True while a sync operation is in progress
     pub is_syncing: Arc<AtomicBool>,
+    /// Number of in-flight background key/value fetches. UI should repaint while nonzero.
+    pub pending_fetches: Arc<AtomicU32>,
+    /// Keys currently being fetched ("root:path"), prevents duplicate fetch threads.
+    in_flight_fetches: Arc<Mutex<HashSet<String>>>,
+    /// In-memory subkey cache: "root:path" -> sorted subkey names.
+    /// Stored behind Arc so the main-thread clone is O(1) (ref-count bump only).
+    subkey_cache: Arc<Mutex<HashMap<String, Arc<Vec<String>>>>>,
+    /// In-memory value cache: "root:path" -> values.
+    value_cache: Arc<Mutex<HashMap<String, Vec<RegistryValue>>>>,
+    /// In-memory bookmark list, kept in sync with SQLite on every mutation.
+    bookmarks_cache: Arc<Mutex<Vec<Bookmark>>>,
+    /// In-memory pending changes list, kept in sync with SQLite on every mutation.
+    pending_changes_cache: Arc<Mutex<Vec<(i64, PendingChange)>>>,
     /// Current progress (keys processed) during sync
     pub sync_progress: Arc<AtomicU64>,
     /// Total items to process during sync
@@ -376,6 +389,12 @@ impl SyncStore {
         let store = Self {
             db_path: Arc::new(db_path),
             is_syncing: Arc::new(AtomicBool::new(false)),
+            pending_fetches: Arc::new(AtomicU32::new(0)),
+            in_flight_fetches: Arc::new(Mutex::new(HashSet::new())),
+            subkey_cache: Arc::new(Mutex::new(HashMap::<String, Arc<Vec<String>>>::new())),
+            value_cache: Arc::new(Mutex::new(HashMap::new())),
+            bookmarks_cache: Arc::new(Mutex::new(Vec::new())),
+            pending_changes_cache: Arc::new(Mutex::new(Vec::new())),
             sync_progress: Arc::new(AtomicU64::new(0)),
             sync_total: Arc::new(AtomicU64::new(0)),
             current_sync_item: Arc::new(Mutex::new(String::new())),
@@ -393,9 +412,23 @@ impl SyncStore {
         // If database opens successfully, initialize schema and load stats
         // `if let Ok(x) = result` is a pattern that only runs if result is Ok
         if let Ok(conn) = store.open_db() {
-            init_sync_schema(&conn);    // Create tables if they don't exist
-            store.refresh_stats(&conn); // Load pending change count
+            init_sync_schema(&conn);
+            store.load_settings(&conn);
+            store.refresh_stats(&conn);
+            store.reload_pending_changes_cache(&conn);
+            store.reload_bookmarks_cache(&conn);
         }
+
+        // Run a WAL checkpoint in the background so a large WAL file from a
+        // previous interrupted session doesn't slow down future open_db() calls.
+        // Done asynchronously so it never blocks the UI or startup.
+        let store_for_ckpt = store.clone();
+        std::thread::spawn(move || {
+            if let Ok(conn) = store_for_ckpt.open_db() {
+                // PASSIVE: checkpoints whatever is possible without blocking writers.
+                conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)").ok();
+            }
+        });
 
         store
     }
@@ -433,7 +466,8 @@ impl SyncStore {
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA cache_size = -8000;
-             PRAGMA temp_store = MEMORY;",
+             PRAGMA temp_store = MEMORY;
+             PRAGMA wal_autocheckpoint = 50;",
         )?;
         Ok(conn)
     }
@@ -453,6 +487,132 @@ impl SyncStore {
             .unwrap_or(0);
         let mut stats = self.stats.lock().unwrap();
         stats.pending_changes = pending;
+    }
+
+    fn reload_pending_changes_cache(&self, conn: &Connection) {
+        let mut stmt = match conn
+            .prepare("SELECT id, change_json FROM pending_changes ORDER BY created_at")
+        {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let changes: Vec<(i64, PendingChange)> = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .filter_map(|(id, json)| {
+                serde_json::from_str::<PendingChange>(&json).ok().map(|c| (id, c))
+            })
+            .collect();
+        *self.pending_changes_cache.lock().unwrap() = changes;
+    }
+
+    fn reload_bookmarks_cache(&self, conn: &Connection) {
+        let mut stmt = match conn.prepare(
+            "SELECT name, path, notes, color FROM bookmarks ORDER BY sort_order",
+        ) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let bms: Vec<Bookmark> = stmt
+            .query_map([], |row| {
+                Ok(Bookmark {
+                    name: row.get(0)?,
+                    path: row.get(1)?,
+                    notes: row.get::<_, String>(2).unwrap_or_default(),
+                    color: row
+                        .get::<_, Option<String>>(3)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| color_from_str(&s)),
+                })
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        *self.bookmarks_cache.lock().unwrap() = bms;
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Settings Persistence
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    /// Load settings from the database.
+    fn load_settings(&self, conn: &Connection) {
+        // Load auto_pull_enabled
+        if let Ok(val) = conn.query_row(
+            "SELECT value FROM settings WHERE key = 'auto_pull_enabled'",
+            [],
+            |row| row.get::<_, String>(0),
+        ) {
+            self.auto_pull_enabled.store(val == "true", Ordering::SeqCst);
+        }
+
+        // Load auto_pull_interval_secs
+        if let Ok(val) = conn.query_row(
+            "SELECT value FROM settings WHERE key = 'auto_pull_interval_secs'",
+            [],
+            |row| row.get::<_, String>(0),
+        ) {
+            if let Ok(secs) = val.parse::<u64>() {
+                *self.auto_pull_interval_secs.lock().unwrap() = secs;
+            }
+        }
+
+        // Load pull_max_depth
+        if let Ok(val) = conn.query_row(
+            "SELECT value FROM settings WHERE key = 'pull_max_depth'",
+            [],
+            |row| row.get::<_, String>(0),
+        ) {
+            let depth = if val == "unlimited" {
+                None
+            } else {
+                val.parse::<usize>().ok()
+            };
+            *self.pull_max_depth.lock().unwrap() = depth;
+        }
+    }
+
+    /// Save a single setting to the database.
+    pub fn save_setting(&self, key: &str, value: &str) {
+        if let Ok(conn) = self.open_db() {
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            ).ok();
+        }
+    }
+
+    /// Load a single setting from the database.
+    pub fn load_setting(&self, key: &str) -> Option<String> {
+        let conn = self.open_db().ok()?;
+        conn.query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        ).ok()
+    }
+
+    /// Save auto_pull_enabled setting.
+    pub fn save_auto_pull_enabled(&self) {
+        let val = if self.auto_pull_enabled.load(Ordering::Relaxed) { "true" } else { "false" };
+        self.save_setting("auto_pull_enabled", val);
+    }
+
+    /// Save auto_pull_interval_secs setting.
+    pub fn save_auto_pull_interval(&self) {
+        let secs = self.auto_pull_interval_secs.lock().unwrap().to_string();
+        self.save_setting("auto_pull_interval_secs", &secs);
+    }
+
+    /// Save pull_max_depth setting.
+    pub fn save_pull_max_depth(&self) {
+        let val = match *self.pull_max_depth.lock().unwrap() {
+            Some(d) => d.to_string(),
+            None => "unlimited".to_string(),
+        };
+        self.save_setting("pull_max_depth", &val);
     }
 
     /// Returns true if there are any pending changes waiting to be synced.
@@ -548,6 +708,115 @@ impl SyncStore {
         results
     }
 
+    /// Gets subkeys from the in-memory cache — no disk I/O, safe to call every frame.
+    /// Returns empty if not yet fetched. Use `fetch_subkeys_async` to populate.
+    pub fn get_subkeys_cached_only(&self, root: &RootKey, path: &str) -> Arc<Vec<String>> {
+        let key = format!("{}:{}", root, path);
+        self.subkey_cache.lock().unwrap()
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
+    /// Returns true if subkeys for this path are already in the in-memory cache.
+    pub fn has_cached_subkeys(&self, root: &RootKey, path: &str) -> bool {
+        let key = format!("{}:{}", root, path);
+        self.subkey_cache.lock().unwrap().contains_key(&key)
+    }
+
+    /// Returns `(subkeys, is_fetched)` in a single mutex acquire — safe to call every frame.
+    /// The Arc clone is O(1); the main thread never copies the full Vec.
+    pub fn get_subkeys_cached(&self, root: &RootKey, path: &str) -> (Arc<Vec<String>>, bool) {
+        let key = format!("{}:{}", root, path);
+        let cache = self.subkey_cache.lock().unwrap();
+        match cache.get(&key) {
+            Some(v) => (Arc::clone(v), true),
+            None => (Arc::new(Vec::new()), false),
+        }
+    }
+
+    /// Returns the number of paths currently in the subkey cache (for debug overlay).
+    pub fn subkey_cache_len(&self) -> usize {
+        self.subkey_cache.lock().unwrap().len()
+    }
+
+    /// Fetches subkeys from the registry on a background thread and caches them.
+    /// No-ops if a fetch for this path is already in-flight.
+    pub fn fetch_subkeys_async(&self, root: &RootKey, path: &str) {
+        let key = format!("{}:{}", root, path);
+        {
+            let mut in_flight = self.in_flight_fetches.lock().unwrap();
+            if !in_flight.insert(key.clone()) {
+                return;
+            }
+        }
+        self.pending_fetches.fetch_add(1, Ordering::Relaxed);
+        let store = self.clone();
+        let root = root.clone();
+        let path = path.to_string();
+        std::thread::spawn(move || {
+            if let Ok(subkeys) = registry::enumerate_subkeys(&root, &path) {
+                // Wrap in Arc so both the cache and this thread can hold a reference.
+                let cached = Arc::new(subkeys);
+                
+                // Pre-fetch one level deeper: check if each child has children.
+                // This allows the UI to know immediately which nodes are leaves.
+                // We collect all results first, then insert everything at once
+                // to avoid the UI rendering partially-fetched state.
+                let mut grandchildren_results: Vec<(String, Arc<Vec<String>>)> = Vec::new();
+                
+                for subkey in cached.iter() {
+                    let child_path = if path.is_empty() {
+                        subkey.clone()
+                    } else {
+                        format!("{}\\{}", path, subkey)
+                    };
+                    let child_key = format!("{}:{}", root, child_path);
+                    
+                    // Only fetch if not already cached
+                    if !store.subkey_cache.lock().unwrap().contains_key(&child_key) {
+                        let grandchildren = registry::enumerate_subkeys(&root, &child_path)
+                            .unwrap_or_else(|_| Vec::new());
+                        grandchildren_results.push((child_key, Arc::new(grandchildren)));
+                    }
+                }
+                
+                // Now insert everything at once: parent's subkeys + all grandchildren
+                {
+                    let mut cache = store.subkey_cache.lock().unwrap();
+                    cache.insert(key.clone(), Arc::clone(&cached));
+                    for (child_key, grandchildren) in grandchildren_results {
+                        cache.insert(child_key, grandchildren);
+                    }
+                }
+                
+                // ── Signal UI immediately ─────────────────────────────────────────
+                // The in-memory cache is now populated; decrement pending_fetches so
+                // the repaint loop (pending_fetches > 0 → request_repaint) stops
+                // waiting and shows the children on the next frame.
+                // SQLite persistence happens AFTER this point and does NOT gate the UI.
+                store.in_flight_fetches.lock().unwrap().remove(&key);
+                store.pending_fetches.fetch_sub(1, Ordering::Relaxed);
+                // ── Background SQLite persistence (does not affect UI) ────────────
+                if let Ok(conn) = store.open_db() {
+                    conn.execute_batch("BEGIN").ok();
+                    for subkey in cached.iter() {
+                        let child_path = if path.is_empty() {
+                            subkey.clone()
+                        } else {
+                            format!("{}\\{}", path, subkey)
+                        };
+                        store.cache_key(&conn, &root, &child_path, 0, false);
+                    }
+                    conn.execute_batch("COMMIT").ok();
+                }
+            } else {
+                store.in_flight_fetches.lock().unwrap().remove(&key);
+                store.pending_fetches.fetch_sub(1, Ordering::Relaxed);
+            }
+        });
+    }
+
     /// Gets the values stored under a registry key.
     ///
     /// # Registry Values vs Keys
@@ -600,6 +869,52 @@ impl SyncStore {
             .collect();
 
         Ok(values)
+    }
+
+    /// Gets values from the in-memory cache — no disk I/O, safe to call every frame.
+    /// Returns empty if not yet fetched. Use `fetch_values_async` to populate.
+    pub fn get_values_cached_only(&self, root: &RootKey, path: &str) -> Vec<RegistryValue> {
+        let key = format!("values:{}:{}", root, path);
+        self.value_cache.lock().unwrap().get(&key).cloned().unwrap_or_default()
+    }
+
+    /// Returns true if values for this key are already in the in-memory cache.
+    pub fn has_cached_values(&self, root: &RootKey, path: &str) -> bool {
+        let key = format!("values:{}:{}", root, path);
+        self.value_cache.lock().unwrap().contains_key(&key)
+    }
+
+    /// Fetches values for a key from the registry on a background thread and caches them.
+    /// No-ops if a fetch for this path is already in-flight.
+    pub fn fetch_values_async(&self, root: &RootKey, path: &str) {
+        let key = format!("values:{}:{}", root, path);
+        {
+            let mut in_flight = self.in_flight_fetches.lock().unwrap();
+            if !in_flight.insert(key.clone()) {
+                return;
+            }
+        }
+        self.pending_fetches.fetch_add(1, Ordering::Relaxed);
+        let store = self.clone();
+        let root = root.clone();
+        let path = path.to_string();
+        std::thread::spawn(move || {
+            if let Ok(values) = registry::enumerate_values(&root, &path) {
+                // Move values into cache (no clone needed — pull_key_values re-reads
+                // from the registry for SQLite, so we don't need values after this).
+                store.value_cache.lock().unwrap().insert(key.clone(), values);
+                // Signal UI immediately — same pattern as fetch_subkeys_async.
+                store.in_flight_fetches.lock().unwrap().remove(&key);
+                store.pending_fetches.fetch_sub(1, Ordering::Relaxed);
+                // Background SQLite persistence (does not affect UI).
+                if let Ok(conn) = store.open_db() {
+                    let _ = store.pull_key_values(&conn, &root, &path);
+                }
+            } else {
+                store.in_flight_fetches.lock().unwrap().remove(&key);
+                store.pending_fetches.fetch_sub(1, Ordering::Relaxed);
+            }
+        });
     }
 
     /// Checks if a key exists in our SQLite cache.
@@ -945,31 +1260,11 @@ impl SyncStore {
             params![json, now_timestamp()],
         )
         .ok();
+        self.reload_pending_changes_cache(conn);
     }
 
     pub fn get_pending_changes(&self) -> Vec<(i64, PendingChange)> {
-        let conn = match self.open_db() {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
-
-        let mut stmt = conn
-            .prepare("SELECT id, change_json FROM pending_changes ORDER BY created_at")
-            .unwrap();
-
-        stmt.query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let json: String = row.get(1)?;
-            Ok((id, json))
-        })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .filter_map(|(id, json)| {
-            serde_json::from_str::<PendingChange>(&json)
-                .ok()
-                .map(|c| (id, c))
-        })
-        .collect()
+        self.pending_changes_cache.lock().unwrap().clone()
     }
 
     pub fn discard_pending_change(&self, change_id: i64) {
@@ -980,6 +1275,7 @@ impl SyncStore {
         conn.execute("DELETE FROM pending_changes WHERE id = ?1", params![change_id])
             .ok();
         self.refresh_stats(&conn);
+        self.reload_pending_changes_cache(&conn);
     }
 
     pub fn discard_all_pending_changes(&self) {
@@ -987,8 +1283,6 @@ impl SyncStore {
             Ok(c) => c,
             Err(_) => return,
         };
-
-        // Reset dirty flags and deleted markers
         conn.execute_batch(
             "BEGIN;
              UPDATE keys SET dirty = 0;
@@ -999,8 +1293,8 @@ impl SyncStore {
              COMMIT;",
         )
         .ok();
-
         self.refresh_stats(&conn);
+        self.reload_pending_changes_cache(&conn);
     }
 
     // ── Sync to Registry (Push) ─────────────────────────────────────────────
@@ -1577,44 +1871,17 @@ impl SyncStore {
 
     // ── Bookmarks ───────────────────────────────────────────────────────────
 
-    pub fn get_bookmarks(&self) -> Vec<crate::bookmarks::Bookmark> {
-        let conn = match self.open_db() {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
-
-        let mut stmt = conn
-            .prepare("SELECT name, path, notes, color, sort_order FROM bookmarks ORDER BY sort_order")
-            .unwrap();
-
-        stmt.query_map([], |row| {
-            Ok(crate::bookmarks::Bookmark {
-                name: row.get(0)?,
-                path: row.get(1)?,
-                notes: row.get::<_, String>(2).unwrap_or_default(),
-                color: row
-                    .get::<_, Option<String>>(3)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| color_from_str(&s)),
-            })
-        })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect()
+    pub fn get_bookmarks(&self) -> Vec<Bookmark> {
+        self.bookmarks_cache.lock().unwrap().clone()
     }
 
-    pub fn add_bookmark(&self, bm: &crate::bookmarks::Bookmark) {
+    pub fn add_bookmark(&self, bm: &Bookmark) {
         let conn = match self.open_db() {
             Ok(c) => c,
             Err(_) => return,
         };
         let max_order: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(sort_order), 0) FROM bookmarks",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COALESCE(MAX(sort_order), 0) FROM bookmarks", [], |r| r.get(0))
             .unwrap_or(0);
         let color_str = bm.color.as_ref().map(|c| c.name().to_string());
         conn.execute(
@@ -1622,6 +1889,7 @@ impl SyncStore {
             params![bm.name, bm.path, bm.notes, color_str, max_order + 1],
         )
         .ok();
+        self.reload_bookmarks_cache(&conn);
     }
 
     pub fn remove_bookmark(&self, path: &str) {
@@ -1629,11 +1897,11 @@ impl SyncStore {
             Ok(c) => c,
             Err(_) => return,
         };
-        conn.execute("DELETE FROM bookmarks WHERE path = ?1", params![path])
-            .ok();
+        conn.execute("DELETE FROM bookmarks WHERE path = ?1", params![path]).ok();
+        self.reload_bookmarks_cache(&conn);
     }
 
-    pub fn update_bookmark(&self, path: &str, bm: &crate::bookmarks::Bookmark) {
+    pub fn update_bookmark(&self, path: &str, bm: &Bookmark) {
         let conn = match self.open_db() {
             Ok(c) => c,
             Err(_) => return,
@@ -1644,20 +1912,11 @@ impl SyncStore {
             params![bm.name, bm.notes, color_str, path],
         )
         .ok();
+        self.reload_bookmarks_cache(&conn);
     }
 
     pub fn is_bookmarked(&self, path: &str) -> bool {
-        let conn = match self.open_db() {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        conn.query_row(
-            "SELECT COUNT(*) FROM bookmarks WHERE path = ?1",
-            params![path],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-            > 0
+        self.bookmarks_cache.lock().unwrap().iter().any(|b| b.path == path)
     }
 
     pub fn move_bookmark(&self, path: &str, direction: i32) {
@@ -1665,7 +1924,6 @@ impl SyncStore {
             Ok(c) => c,
             Err(_) => return,
         };
-
         let current_order: i64 = match conn.query_row(
             "SELECT sort_order FROM bookmarks WHERE path = ?1",
             params![path],
@@ -1674,7 +1932,6 @@ impl SyncStore {
             Ok(o) => o,
             Err(_) => return,
         };
-
         let swap_order = current_order + direction as i64;
         let swap_path: Option<String> = conn
             .query_row(
@@ -1683,7 +1940,6 @@ impl SyncStore {
                 |r| r.get(0),
             )
             .ok();
-
         if let Some(sp) = swap_path {
             conn.execute_batch("BEGIN").ok();
             conn.execute(
@@ -1698,6 +1954,7 @@ impl SyncStore {
             .ok();
             conn.execute_batch("COMMIT").ok();
         }
+        self.reload_bookmarks_cache(&conn);
     }
 
     /// Check if a key exists in SQLite cache
@@ -2119,6 +2376,11 @@ fn init_sync_schema(conn: &Connection) {
             notes      TEXT NOT NULL DEFAULT '',
             color      TEXT,
             sort_order INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key        TEXT PRIMARY KEY,
+            value      TEXT NOT NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_keys_name_lower ON keys(name_lower);
