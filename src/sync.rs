@@ -502,9 +502,11 @@ impl SyncStore {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
-             PRAGMA cache_size = -8000;
+             PRAGMA cache_size = -32000;
              PRAGMA temp_store = MEMORY;
-             PRAGMA wal_autocheckpoint = 50;",
+             PRAGMA wal_autocheckpoint = 100;
+             PRAGMA mmap_size = 268435456;
+             PRAGMA page_size = 4096;",
         )?;
         Ok(conn)
     }
@@ -524,6 +526,30 @@ impl SyncStore {
             .unwrap_or(0);
         let mut stats = self.stats.lock().unwrap();
         stats.pending_changes = pending;
+    }
+
+    /// Optimize the database by running ANALYZE and VACUUM.
+    /// 
+    /// Call this periodically (e.g., on app startup or after large imports)
+    /// to help SQLite's query planner make better decisions.
+    /// 
+    /// - `ANALYZE`: Updates table statistics for query optimization
+    /// - `VACUUM`: Rebuilds the database file, reclaiming space and defragmenting
+    pub fn optimize(&self) {
+        if let Ok(conn) = self.open_db() {
+            // Update query planner statistics
+            conn.execute_batch("ANALYZE").ok();
+        }
+    }
+
+    /// Compact the database by running VACUUM.
+    /// 
+    /// This can be slow for large databases but reclaims disk space
+    /// and improves performance by defragmenting the file.
+    pub fn vacuum(&self) {
+        if let Ok(conn) = self.open_db() {
+            conn.execute_batch("VACUUM").ok();
+        }
     }
 
     fn reload_pending_changes_cache(&self, conn: &Connection) {
@@ -2614,10 +2640,14 @@ fn init_sync_schema(conn: &Connection) {
 
         CREATE INDEX IF NOT EXISTS idx_keys_name_lower ON keys(name_lower);
         CREATE INDEX IF NOT EXISTS idx_keys_parent ON keys(root, parent_path);
-        CREATE INDEX IF NOT EXISTS idx_keys_dirty ON keys(dirty);
+        CREATE INDEX IF NOT EXISTS idx_keys_dirty ON keys(dirty) WHERE dirty = 1;
+        CREATE INDEX IF NOT EXISTS idx_keys_deleted ON keys(deleted) WHERE deleted = 0;
+        CREATE INDEX IF NOT EXISTS idx_keys_root_path ON keys(root, path);
         CREATE INDEX IF NOT EXISTS idx_vals_key ON key_values(root, key_path);
-        CREATE INDEX IF NOT EXISTS idx_vals_dirty ON key_values(dirty);
-        CREATE INDEX IF NOT EXISTS idx_vals_name ON key_values(LOWER(value_name));",
+        CREATE INDEX IF NOT EXISTS idx_vals_dirty ON key_values(dirty) WHERE dirty = 1;
+        CREATE INDEX IF NOT EXISTS idx_vals_deleted ON key_values(deleted) WHERE deleted = 0;
+        CREATE INDEX IF NOT EXISTS idx_vals_name ON key_values(LOWER(value_name));
+        CREATE INDEX IF NOT EXISTS idx_vals_name_lower ON key_values(root, key_path, LOWER(value_name));",
     )
     .ok();
 }
